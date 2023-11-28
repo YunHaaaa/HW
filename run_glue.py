@@ -680,59 +680,38 @@ def main():
 
     for epoch in range(int(training_args.num_train_epochs)):
         for step, batch in enumerate(train_dataloader):
-            if model_args.train_teacher:
-                if model_args.use_lgtm:
-                    model.train()
-                    teacher_model.train()
-                    # fetch the batch for calculating student's feedback 
-                    try:
-                        held_inputs = next(held_iter)
-                    except:
-                        held_iter = iter(eval_dataloader)
-                        held_inputs = next(held_iter)
-                    # update the teacher
-                    model_total.step(batch, held_inputs, optimizer)
-                else:
-                    model.eval()
-                    teacher_model.train()
-                    with torch.no_grad():
-                        outputs = model(**batch)
-                        logits = outputs.logits
-                    teacher_outputs = teacher_model(**batch)
-                    t_loss, t_logits = teacher_outputs.loss, teacher_outputs.logits
-                    t_loss = model_args.t_alpha_kd * cal_loss(t_logits,logits, model_args.temperature) + (1 - model_args.t_alpha_kd) * t_loss
-                    
-                    # update the teacher
-                    t_loss.backward()
-                
-                    if step % training_args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
-                        t_optimizer.step()
-                        t_lr_scheduler.step()
-                        t_optimizer.zero_grad()
+            # use teacher logits as soft labels
+            teacher_model.eval()
+            model.train()
+                        
+            with torch.no_grad():
+                teacher_outputs = teacher_model(**batch)
+                t_logits = teacher_outputs.logits
 
-                # use teacher logits as soft labels
-                teacher_model.eval()
-                model.train()
-                            
-                with torch.no_grad():
-                    teacher_outputs = teacher_model(**batch)
-                    t_logits = teacher_outputs.logits
+            outputs = model(**batch)
+            loss, logits = outputs.loss, outputs.logits
+            loss = model_args.alpha_kd * cal_loss(logits, t_logits, model_args.temperature) + (1-model_args.alpha_kd) * loss
+        
+            # update the student
+            loss.backward()
 
+            model.eval()
+            teacher_model.train()
+
+            with torch.no_grad():
                 outputs = model(**batch)
-                loss, logits = outputs.loss, outputs.logits
-                loss = model_args.alpha_kd * cal_loss(logits, t_logits, model_args.temperature) + (1-model_args.alpha_kd) * loss
-            else: # no teacher update
-                # student loss
-                model.train()
-                outputs = model(**batch)
-                loss, logits = outputs.loss, outputs.logits
-                
-                teacher_model.eval()
-                with torch.no_grad():
-                    teacher_outputs = teacher_model(**batch)
-                    t_logits = teacher_outputs.logits
-
-                loss = model_args.alpha_kd * cal_loss(logits, t_logits, model_args.temperature) + (1 - model_args.alpha_kd) * loss
+                logits = outputs.logits
+            teacher_outputs = teacher_model(**batch)
+            t_loss, t_logits = teacher_outputs.loss, teacher_outputs.logits
+            t_loss = model_args.t_alpha_kd * cal_loss(t_logits,logits, model_args.temperature) + (1 - model_args.t_alpha_kd) * t_loss
+            
+            # update the teacher
+            t_loss.backward()
+        
+            if step % training_args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
+                t_optimizer.step()
+                t_lr_scheduler.step()
+                t_optimizer.zero_grad()
 
             # update the student 
             loss = loss / int(training_args.gradient_accumulation_steps)
