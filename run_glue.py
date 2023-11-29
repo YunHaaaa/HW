@@ -7,8 +7,8 @@ from dataclasses import dataclass, field
 from typing import Optional
 from accelerate import Accelerator
 
-from model_arguments import ModelArguments
-from data_training_arguments import DataTrainingArguments
+from model_args import ModelArguments
+from data_args import DataTrainingArguments
 import constants
 
 import inspect
