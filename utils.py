@@ -2,14 +2,35 @@ import os
 import logging
 import sys
 import datasets
+import inspect
 from datasets import load_dataset
-
+import numpy as np
 import transformers
 from transformers.trainer_utils import get_last_checkpoint
 from transformers import AutoConfig, AutoTokenizer, AutoModelForSequenceClassification
 
+from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+def remove_unused_columns(model, dataset: "datasets.Dataset", description: Optional[str] = None):
+    signature = inspect.signature(model.forward)
+    _signature_columns = list(signature.parameters.keys())
+    # Labels may be named label or label_ids, the default data collator handles that.
+    _signature_columns += ["label", "label_ids"]
+    columns = [k for k in _signature_columns if k in dataset.column_names]
+    ignored_columns = list(set(dataset['train'].column_names) - set(_signature_columns))
+    if len(ignored_columns) > 0:
+        dset_description = "" if description is None else f"in the {description} set "
+        logger.info(
+            f"The following columns {dset_description} don't have a corresponding argument in "
+            f"`{model.__class__.__name__}.forward` and have been ignored: {', '.join(ignored_columns)}."
+        )
+    return dataset.remove_columns(ignored_columns)
+
+def init_classifier_as_zero(model):
+    for params in model.classifier.parameters():
+        params.data.fill_(0.0)
 
 def setup_logging(training_args):
     # Setup logging
@@ -139,3 +160,19 @@ def load_model_and_tokenizer(model_args, data_args, num_labels):
     )
 
     return config, tokenizer, model
+
+
+def perform_prediction(trainer, predict_dataset, task, output_predict_file, is_regression=False, label_list=None):
+    predict_dataset = predict_dataset.remove_columns("label")
+    predictions = trainer.predict(predict_dataset, metric_key_prefix="predict").predictions
+    predictions = np.squeeze(predictions) if is_regression else np.argmax(predictions, axis=1)
+
+    with open(output_predict_file, "w") as writer:
+        logger.info(f"***** Predict results {task} *****")
+        writer.write("index\tprediction\n")
+        for index, item in enumerate(predictions):
+            if is_regression:
+                writer.write(f"{index}\t{item:3.3f}\n")
+            else:
+                item = label_list[item]
+                writer.write(f"{index}\t{item}\n")

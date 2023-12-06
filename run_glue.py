@@ -3,18 +3,16 @@ import os
 import random
 import sys
 import math
-from typing import Optional
 from accelerate import Accelerator
 
+from pruning.utils import get_weight_threshold, weight_prune, get_filter_mask, filter_prune, cal_sparsity
 from model_args import ModelArguments
 from data_args import DataTrainingArguments
 import constants
 import utils
 
-import inspect
-import datasets
 import numpy as np
-from datasets import load_dataset, load_metric
+from datasets import load_metric
 import torch
 import json
 
@@ -22,7 +20,6 @@ from transformers import (
     AdamW,
     AutoConfig,
     AutoModelForSequenceClassification,
-    AutoTokenizer,
     DataCollatorWithPadding,
     EvalPrediction,
     HfArgumentParser,
@@ -48,25 +45,6 @@ require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/text
 
 logger = logging.getLogger(__name__)
 
-
-def _remove_unused_columns(model, dataset: "datasets.Dataset", description: Optional[str] = None):
-    signature = inspect.signature(model.forward)
-    _signature_columns = list(signature.parameters.keys())
-    # Labels may be named label or label_ids, the default data collator handles that.
-    _signature_columns += ["label", "label_ids"]
-    columns = [k for k in _signature_columns if k in dataset.column_names]
-    ignored_columns = list(set(dataset['train'].column_names) - set(_signature_columns))
-    if len(ignored_columns) > 0:
-        dset_description = "" if description is None else f"in the {description} set "
-        logger.info(
-            f"The following columns {dset_description} don't have a corresponding argument in "
-            f"`{model.__class__.__name__}.forward` and have been ignored: {', '.join(ignored_columns)}."
-        )
-    return dataset.remove_columns(ignored_columns)
-
-def init_classifier_as_zero(model):
-    for params in model.classifier.parameters():
-        params.data.fill_(0.0)
     
 def main():
 
@@ -170,7 +148,7 @@ def main():
             load_from_cache_file=not data_args.overwrite_cache,
             desc="Running tokenizer on dataset",
         )
-        raw_datasets = _remove_unused_columns(model, raw_datasets)
+        raw_datasets = utils.remove_unused_columns(model, raw_datasets)
         
     if training_args.do_train:
         train_dataset = raw_datasets["train"]
@@ -250,22 +228,9 @@ def main():
 
         for predict_dataset, task in zip(predict_datasets, tasks):
             # Removing the `label` columns because it contains -1 and Trainer won't like that.
-            
-            predict_dataset = predict_dataset.remove_columns("label")
-            predictions = trainer.predict(predict_dataset, metric_key_prefix="predict").predictions
-            predictions = np.squeeze(predictions) if is_regression else np.argmax(predictions, axis=1)
-            
             output_predict_file = os.path.join(training_args.output_dir, f"{task}.tsv")
-            if trainer.is_world_process_zero():
-                with open(output_predict_file, "w") as writer:
-                    logger.info(f"***** Predict results {task} *****")
-                    writer.write("index\tprediction\n")
-                    for index, item in enumerate(predictions):
-                        if is_regression:
-                            writer.write(f"{index}\t{item:3.3f}\n")
-                        else:
-                            item = label_list[item]
-                            writer.write(f"{index}\t{item}\n")
+            utils.perform_prediction(trainer, predict_dataset, task, output_predict_file, is_regression, label_list)
+
         return
 
     train_dataloader = DataLoader(
@@ -279,8 +244,8 @@ def main():
         t_optimizer = AdamW(teacher_model.parameters(), lr=model_args.t_learning_rate)
     
         if model_args.init_classifier_to_zero:
-            init_classifier_as_zero(teacher_model)
-            init_classifier_as_zero(model)
+            utils.init_classifier_as_zero(teacher_model)
+            utils.init_classifier_as_zero(model)
 
     # Scheduler and math around the number of training steps.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / training_args.gradient_accumulation_steps)
@@ -344,7 +309,7 @@ def main():
 
             outputs = model(**batch)
             loss, logits = outputs.loss, outputs.logits
-            loss = model_args.alpha_kd * cal_loss(logits, t_logits, model_args.temperature) + (1-model_args.alpha_kd) * loss
+            loss = model_args.alpha_kd * cal_loss(logits, t_logits, model_args.temperature) + (1 - model_args.alpha_kd) * loss
         
             # update the student
             loss.backward()
@@ -355,6 +320,7 @@ def main():
             with torch.no_grad():
                 outputs = model(**batch)
                 logits = outputs.logits
+
             teacher_outputs = teacher_model(**batch)
             t_loss, t_logits = teacher_outputs.loss, teacher_outputs.logits
             t_loss = model_args.t_alpha_kd * cal_loss(t_logits,logits, model_args.temperature) + (1 - model_args.t_alpha_kd) * t_loss
