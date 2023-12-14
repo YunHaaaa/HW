@@ -302,9 +302,15 @@ def main():
         threshold = get_weight_threshold(teacher_model, rate=0.8, args=model_args)
         weight_prune(teacher_model, threshold, model_args)
 
+    # Print teacher model state_dict after pruning
+    print("Teacher Model State_dict After Pruning:")
+    for name, param in teacher_model.state_dict().items():
+        print(name, param)
 
     for epoch in range(int(training_args.num_train_epochs)):
         for step, batch in enumerate(train_dataloader):
+
+            # TODO: 이대로 테스트 해보고 합쳐서 확인
             # use teacher logits as soft labels
             teacher_model.eval()
             model.train()
