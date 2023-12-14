@@ -680,29 +680,35 @@ def main():
 
     for epoch in range(int(training_args.num_train_epochs)):
         for step, batch in enumerate(train_dataloader):            
+            model.eval()
             teacher_model.train()
-            model.train()
-
+            with torch.no_grad():
+                outputs = model(**batch)
+                logits = outputs.logits
             teacher_outputs = teacher_model(**batch)
             t_loss, t_logits = teacher_outputs.loss, teacher_outputs.logits
-
-            outputs = model(**batch)
-            loss, logits = outputs.loss, outputs.logits
-
-            loss = model_args.alpha_kd * cal_loss(logits, t_logits, model_args.temperature) + (1 - model_args.alpha_kd) * loss
-            t_loss = model_args.t_alpha_kd * cal_loss(t_logits, logits, model_args.temperature) + (1 - model_args.t_alpha_kd) * t_loss
-
+            t_loss = model_args.t_alpha_kd * cal_loss(t_logits,logits, model_args.temperature) + (1 - model_args.t_alpha_kd) * t_loss
+            
+            # update the teacher
             t_loss.backward()
-
+        
             if step % training_args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
                 t_optimizer.step()
                 t_lr_scheduler.step()
                 t_optimizer.zero_grad()
 
-            # update the student 
-            loss = loss / int(training_args.gradient_accumulation_steps)
-            loss.backward()
+            # use teacher logits as soft labels
+            teacher_model.eval()
+            model.train()
+           
+            with torch.no_grad():
+                teacher_outputs = teacher_model(**batch)
+                t_logits = teacher_outputs.logits
 
+            outputs = model(**batch)
+            loss, logits = outputs.loss, outputs.logits
+            loss = model_args.alpha_kd * cal_loss(logits, t_logits, model_args.temperature) + (1-model_args.alpha_kd) * loss
+           
             if step % training_args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
                 optimizer.step()
                 lr_scheduler.step()
@@ -714,6 +720,7 @@ def main():
             if completed_steps % training_args.eval_steps == 0 or completed_steps == max_train_steps:
                 model.eval()
                 samples_seen = 0
+
 
                 # student evaluation
                 for step, batch in enumerate(eval_dataloader):
