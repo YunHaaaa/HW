@@ -223,6 +223,12 @@ class ModelArguments:
             "help": "Train teacher or not."
         },
     )
+    gpu_number: int = field(
+        default=1,
+        metadata={
+            "help": "GPU number to use."
+        },
+    )
     t_alpha_kd: float = field(
         default=0.4,
         metadata={
@@ -293,6 +299,37 @@ def main():
         model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+
+    # GPU가 올바르게 설정되었는지 확인하는 코드
+    if torch.cuda.is_available():
+        # 사용 가능한 GPU 디바이스의 수를 얻기
+        gpu_count = torch.cuda.device_count()
+        
+        # 각 GPU의 상세 정보를 출력
+        for i in range(gpu_count):
+            print(f"GPU Device {i}: {torch.cuda.get_device_name(i)}")
+    else:
+        print("No GPUs detected.")
+        
+    # GPU 번호 설정
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(model_args.gpu_number)
+
+    # CUDA_VISIBLE_DEVICES에 설정된 GPU 디바이스 인덱스를 가져옴
+    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
+
+    if cuda_visible_devices is not None:
+        # CUDA_VISIBLE_DEVICES가 설정되어 있다면, 설정된 GPU 디바이스 인덱스를 가져옴
+        cuda_visible_devices = cuda_visible_devices.split(",")  # 쉼표로 구분된 문자열을 리스트로 변환
+        cuda_visible_device_indices = [int(idx) for idx in cuda_visible_devices]
+        
+        # 현재 사용 중인 GPU 디바이스의 인덱스를 가져옴
+        current_device = torch.cuda.current_device()
+        
+        # 설정된 GPU 디바이스 인덱스와 현재 사용 중인 GPU 디바이스 인덱스를 출력
+        print(f"Configured CUDA_VISIBLE_DEVICES: {cuda_visible_device_indices}")
+        print(f"Current GPU Device: {current_device}")
+    else:
+        print("CUDA_VISIBLE_DEVICES not set.")
 
     accelerator = Accelerator()
     os.makedirs(training_args.output_dir, exist_ok=True)
@@ -709,6 +746,10 @@ def main():
             loss, logits = outputs.loss, outputs.logits
             loss = model_args.alpha_kd * cal_loss(logits, t_logits, model_args.temperature) + (1-model_args.alpha_kd) * loss
            
+            # update the student 
+            loss = loss / int(training_args.gradient_accumulation_steps)
+            loss.backward()
+
             if step % training_args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
                 optimizer.step()
                 lr_scheduler.step()
