@@ -69,8 +69,6 @@ def setup_logging(training_args):
                 "the `--output_dir` or add `--overwrite_output_dir` to train from scratch."
             )
 
-    # 함수 호출
-    setup_logging(training_args)
 
 
 def load_glue_dataset(data_args, model_args, training_args):
