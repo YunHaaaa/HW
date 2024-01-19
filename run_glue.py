@@ -62,11 +62,12 @@ def main():
     
     raw_datasets = utils.load_glue_dataset(data_args, model_args, training_args)
     is_regression, num_labels, label_list = utils.process_labels(data_args, raw_datasets)
-    config, tokenizer, model = utils.load_model_and_tokenizer(model_args, data_args, num_labels)
+    config, model = utils.load_model(model_args, data_args, num_labels)
+    tokenizer = utils.load_tokenizer(model_args)
 
-    
     # teacher model(only used in training)
     if training_args.do_train:
+        # t_config, teacher_model = utils.load_model()
         t_config = AutoConfig.from_pretrained(model_args.teacher_model, num_labels=num_labels, finetuning_task=data_args.task_name)
         teacher_model = AutoModelForSequenceClassification.from_pretrained(
             model_args.teacher_model,
@@ -280,7 +281,9 @@ def main():
         model, teacher_model, optimizer, train_dataloader, eval_dataloader = accelerator.prepare(
                 model, teacher_model, optimizer, train_dataloader, eval_dataloader
             )
-     
+    
+    # TODO: Teacher, Student predict -> check performance
+
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / training_args.gradient_accumulation_steps)
     total_batch_size = training_args.per_device_train_batch_size * training_args.gradient_accumulation_steps
 
@@ -335,7 +338,7 @@ def main():
 
             teacher_outputs = teacher_model(**batch)
             t_loss, t_logits = teacher_outputs.loss, teacher_outputs.logits
-            t_loss = model_args.t_alpha_kd * cal_loss(t_logits,logits, model_args.temperature) + (1 - model_args.t_alpha_kd) * t_loss
+            t_loss = model_args.t_alpha_kd * cal_loss(t_logits, logits, model_args.temperature) + (1 - model_args.t_alpha_kd) * t_loss
             
             # update the teacher
             t_loss.backward()
