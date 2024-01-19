@@ -1,13 +1,5 @@
-# LGTM
-✨ [ACL 2023] This is the official implementation of our  paper : ["Tailoring Instructions to Student’s Learning Levels Boosts Knowledge Distillation"](https://arxiv.org/abs/2305.09651).
-
 ## Introduction
 
-We introduce the concept of distillation influence to determine the impact of distillation from each training sample on the student's generalization ability. 
-In this paper, we propose **L**earning **G**ood **T**eacher **M**atters (LGTM), an efficient training technique for incorporating distillation influence into the teacher’s learning process. 
-By prioritizing samples that are likely to enhance the student's generalization ability, our LGTM outperforms 10 common knowledge distillation baselines on 6 text classification tasks in the GLUE benchmark.
-
-![](resources/lgtm.png)
 
 ### Tab of Content
 - [Installation](#1)
@@ -97,15 +89,3 @@ We give some results on validation set.
 
 ### License
 Distributed under the Apache 2.0 license. See LICENSE for more information.
-
-### Cite 
-If you find it helpful, you can cite our paper in your work.
-```sh
-@inproceedings{ren2023tailoring,
-  title={Tailoring Instructions to Student's Learning Levels Boosts Knowledge Distillation},
-  author={Ren, Yuxin and Zhong, Zihan and Shi, Xingjian and Zhu, Yi and Yuan, Chun and Li, Mu},
-  booktitle={Proceedings of the 61st Annual Meeting of the Association for Computational Linguistics},
-  url="https://arxiv.org/abs/2305.09651"
-  year={2023}
-}
- ```

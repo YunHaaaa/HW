@@ -1,42 +1,25 @@
-#!/usr/bin/env python
-# coding=utf-8
-# Copyright 2020 The HuggingFace Inc. team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-""" Finetuning the library models for sequence classification on GLUE."""
-# You can also adapt this script on your own text classification task. Pointers for this are left as comments.
-
 import logging
 import os
 import random
 import sys
 import math
-from dataclasses import dataclass, field
-from typing import Optional
 from accelerate import Accelerator
 
-import datasets
+from pruning.utils import get_weight_threshold, weight_prune, get_filter_mask, filter_prune, cal_sparsity
+from model_args import ModelArguments
+from data_args import DataTrainingArguments
+import constants
+import utils
+
 import numpy as np
-from datasets import load_dataset, load_metric
+from datasets import load_metric
 import torch
 import json
 
-import transformers
 from transformers import (
     AdamW,
     AutoConfig,
     AutoModelForSequenceClassification,
-    AutoTokenizer,
     DataCollatorWithPadding,
     EvalPrediction,
     HfArgumentParser,
@@ -50,7 +33,6 @@ from transformers import (
 # from transformers import BertForSequenceClassification
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
-from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import check_min_version
 from transformers.utils.versions import require_version
 from utils_glue import LGTMTeacher,cal_loss
@@ -60,418 +42,32 @@ check_min_version("4.17.0")
 
 require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/text-classification/requirements.txt")
 
-task_to_keys = {
-    "mnli": ("premise", "hypothesis"),
-    "mrpc": ("sentence1", "sentence2"),
-    "qnli": ("question", "sentence"),
-    "qqp": ("question1", "question2"),
-    "rte": ("sentence1", "sentence2"),
-    "sst2": ("sentence", None),
-}
-
-acc_tasks = ["mnli","qnli", "rte", "sst2"]
-f1_tasks = ["mrpc", "qqp"]
 
 logger = logging.getLogger(__name__)
 
-@dataclass
-class DataTrainingArguments:
-    """
-    Arguments pertaining to what data we are going to input our model for training and eval.
-
-    Using `HfArgumentParser` we can turn this class
-    into argparse arguments to be able to specify them on
-    the command line.
-    """
-
-    task_name: Optional[str] = field(
-        default=None,
-        metadata={"help": "The name of the task to train on: " + ", ".join(task_to_keys.keys())},
-    )
-    dataset_name: Optional[str] = field(
-        default=None, metadata={"help": "The name of the dataset to use (via the datasets library)."}
-    )
-    dataset_config_name: Optional[str] = field(
-        default=None, metadata={"help": "The configuration name of the dataset to use (via the datasets library)."}
-    )
-    max_seq_length: int = field(
-        default=128,
-        metadata={
-            "help": "The maximum total input sequence length after tokenization. Sequences longer "
-            "than this will be truncated, sequences shorter will be padded."
-        },
-    )
-    overwrite_cache: bool = field(
-        default=False, metadata={"help": "Overwrite the cached preprocessed datasets or not."}
-    )
-    pad_to_max_length: bool = field(
-        default=True,
-        metadata={
-            "help": "Whether to pad all samples to `max_seq_length`. "
-            "If False, will pad the samples dynamically when batching to the maximum length in the batch."
-        },
-    )
-    max_train_samples: Optional[int] = field(
-        default=None,
-        metadata={
-            "help": "For debugging purposes or quicker training, truncate the number of training examples to this "
-            "value if set."
-        },
-    )
-    max_eval_samples: Optional[int] = field(
-        default=None,
-        metadata={
-            "help": "For debugging purposes or quicker training, truncate the number of evaluation examples to this "
-            "value if set."
-        },
-    )
-    max_predict_samples: Optional[int] = field(
-        default=None,
-        metadata={
-            "help": "For debugging purposes or quicker training, truncate the number of prediction examples to this "
-            "value if set."
-        },
-    )
-    train_file: Optional[str] = field(
-        default=None, metadata={"help": "A csv or a json file containing the training data."}
-    )
-    validation_file: Optional[str] = field(
-        default=None, metadata={"help": "A csv or a json file containing the validation data."}
-    )
-    test_file: Optional[str] = field(default=None, metadata={"help": "A csv or a json file containing the test data."})
-
-    def __post_init__(self):
-        if self.task_name is not None:
-            self.task_name = self.task_name.lower()
-            if self.task_name not in task_to_keys.keys():
-                raise ValueError("Unknown task, you should pick one in " + ",".join(task_to_keys.keys()))
-        elif self.dataset_name is not None:
-            pass
-        elif self.train_file is None or self.validation_file is None:
-            raise ValueError("Need either a GLUE task, a training/validation file or a dataset name.")
-        else:
-            train_extension = self.train_file.split(".")[-1]
-            assert train_extension in ["csv", "json"], "`train_file` should be a csv or a json file."
-            validation_extension = self.validation_file.split(".")[-1]
-            assert (
-                validation_extension == train_extension
-            ), "`validation_file` should have the same extension (csv or json) as `train_file`."
-
-@dataclass
-class ModelArguments:
-    """
-    Arguments pertaining to which model/config/tokenizer we are going to fine-tune from.
-    """
-
-    model_name_or_path: str = field(
-        metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"}
-    )
-    config_name: Optional[str] = field(
-        default=None, metadata={"help": "Pretrained config name or path if not the same as model_name"}
-    )
-    tokenizer_name: Optional[str] = field(
-        default=None, metadata={"help": "Pretrained tokenizer name or path if not the same as model_name"}
-    )
-    cache_dir: Optional[str] = field(
-        default=None,
-        metadata={"help": "Where do you want to store the pretrained models downloaded from huggingface.co"},
-    )
-    use_fast_tokenizer: bool = field(
-        default=True,
-        metadata={"help": "Whether to use one of the fast tokenizer (backed by the tokenizers library) or not."},
-    )
-    model_revision: str = field(
-        default="main",
-        metadata={"help": "The specific model version to use (can be a branch name, tag name or commit id)."},
-    )
-    use_auth_token: bool = field(
-        default=False,
-        metadata={
-            "help": "Will use the token generated when running `transformers-cli login` (necessary to use this script "
-            "with private models)."
-        },
-    )
-
-    # kd setting
-    alpha_kd: float = field(
-        default=1.0,
-        metadata={
-            "help": "The weight of kd loss"
-        },
-    )
-    # mode: str = field(
-    #     default="kd",
-    #     metadata={"help": "The type of kd loss"},
-    # )
-    temperature: float = field(
-        default=1,
-        metadata={
-            "help": "The temperature."
-        },
-    )
-
-    # teacher model setting
-    teacher_model: str = field(
-        default=None,
-        metadata={
-            "help": "Path of teacher model."
-        },
-    )
-    train_teacher: bool = field(
-        default=False,
-        metadata={
-            "help": "Train teacher or not."
-        },
-    )
-    gpu_number: int = field(
-        default=1,
-        metadata={
-            "help": "GPU number to use."
-        },
-    )
-    t_alpha_kd: float = field(
-        default=0.4,
-        metadata={
-            "help": "The weight of kd loss if train_teacher is True."
-        },
-    )
-    t_learning_rate: float = field(
-        default=3e-5,
-        metadata={
-            "help": "The learning rate of teacher."
-        },
-    )
-
-    # lgtm setting
-    use_lgtm: bool = field(
-        default=False,
-        metadata={
-            "help": "Use LGTM or not."
-        },
-    )
-    init_classifier_to_zero: bool = field(
-        default=False,
-        metadata={
-            "help": "Initialize the classifier of the teacher and student to zero."
-        },
-    )
-    num_layers: int = field(
-        default=6,
-        metadata={
-            "help": "The layer number of the student model."
-        },
-    )
-
-import inspect
-
-def _remove_unused_columns(model, dataset: "datasets.Dataset", description: Optional[str] = None):
-    # if not self.args.remove_unused_columns:
-    #     return dataset
-    # if _signature_columns is None:
-    # Inspect model forward signature to keep only the arguments it accepts.
-    signature = inspect.signature(model.forward)
-    _signature_columns = list(signature.parameters.keys())
-    # Labels may be named label or label_ids, the default data collator handles that.
-    _signature_columns += ["label", "label_ids"]
-    columns = [k for k in _signature_columns if k in dataset.column_names]
-    ignored_columns = list(set(dataset['train'].column_names) - set(_signature_columns))
-    if len(ignored_columns) > 0:
-        dset_description = "" if description is None else f"in the {description} set "
-        logger.info(
-            f"The following columns {dset_description} don't have a corresponding argument in "
-            f"`{model.__class__.__name__}.forward` and have been ignored: {', '.join(ignored_columns)}."
-        )
-    return dataset.remove_columns(ignored_columns)
-
-def init_classifier_as_zero(model):
-    for params in model.classifier.parameters():
-        params.data.fill_(0.0)
     
 def main():
-    # See all possible arguments in src/transformers/training_args.py
-    # or by passing the --help flag to this script.
-    # We now keep distinct sets of args, for a cleaner separation of concerns.
 
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
-        # If we pass only one argument to the script and it's the path to a json file,
-        # let's parse it to get our arguments.
         model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
-    # GPU가 올바르게 설정되었는지 확인하는 코드
-    if torch.cuda.is_available():
-        # 사용 가능한 GPU 디바이스의 수를 얻기
-        gpu_count = torch.cuda.device_count()
-        
-        # 각 GPU의 상세 정보를 출력
-        for i in range(gpu_count):
-            print(f"GPU Device {i}: {torch.cuda.get_device_name(i)}")
-    else:
-        print("No GPUs detected.")
-        
-    # GPU 번호 설정
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(model_args.gpu_number)
-
-    # CUDA_VISIBLE_DEVICES에 설정된 GPU 디바이스 인덱스를 가져옴
-    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
-
-    if cuda_visible_devices is not None:
-        # CUDA_VISIBLE_DEVICES가 설정되어 있다면, 설정된 GPU 디바이스 인덱스를 가져옴
-        cuda_visible_devices = cuda_visible_devices.split(",")  # 쉼표로 구분된 문자열을 리스트로 변환
-        cuda_visible_device_indices = [int(idx) for idx in cuda_visible_devices]
-        
-        # 현재 사용 중인 GPU 디바이스의 인덱스를 가져옴
-        current_device = torch.cuda.current_device()
-        
-        # 설정된 GPU 디바이스 인덱스와 현재 사용 중인 GPU 디바이스 인덱스를 출력
-        print(f"Configured CUDA_VISIBLE_DEVICES: {cuda_visible_device_indices}")
-        print(f"Current GPU Device: {current_device}")
-    else:
-        print("CUDA_VISIBLE_DEVICES not set.")
-
     accelerator = Accelerator()
     os.makedirs(training_args.output_dir, exist_ok=True)
-    # Setup logging
-    logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-        datefmt="%m/%d/%Y %H:%M:%S",
-        handlers=[logging.StreamHandler(sys.stdout)],
-    )
+    utils.setup_logging(training_args)
 
-    log_level = training_args.get_process_log_level()
-    logger.setLevel(log_level)
-    datasets.utils.logging.set_verbosity(log_level)
-    transformers.utils.logging.set_verbosity(log_level)
-    transformers.utils.logging.enable_default_handler()
-    transformers.utils.logging.enable_explicit_format()
-
-    # Log on each process the small summary:
-    logger.warning(
-        f"Process rank: {training_args.local_rank}, device: {training_args.device}, n_gpu: {training_args.n_gpu}"
-        + f"distributed training: {bool(training_args.local_rank != -1)}, 16-bits training: {training_args.fp16}"
-    )
-    logger.info(f"Training/evaluation parameters {training_args}")
-
-    # Detecting last checkpoint.
-    last_checkpoint = None
-    if os.path.isdir(training_args.output_dir) and training_args.do_train and not training_args.overwrite_output_dir:
-        last_checkpoint = get_last_checkpoint(training_args.output_dir)
-        if last_checkpoint is None and len(os.listdir(training_args.output_dir)) > 0:
-            raise ValueError(
-                f"Output directory ({training_args.output_dir}) already exists and is not empty. "
-                "Use --overwrite_output_dir to overcome."
-            )
-        elif last_checkpoint is not None and training_args.resume_from_checkpoint is None:
-            logger.info(
-                f"Checkpoint detected, resuming training at {last_checkpoint}. To avoid this behavior, change "
-                "the `--output_dir` or add `--overwrite_output_dir` to train from scratch."
-            )
-
-    # Set seed before initializing model.
     set_seed(training_args.seed)
-
-    # Get the datasets: you can either provide your own CSV/JSON training and evaluation files (see below)
-    # or specify a GLUE benchmark task (the dataset will be downloaded automatically from the datasets Hub).
-    #
-    # For CSV/JSON files, this script will use as labels the column called 'label' and as pair of sentences the
-    # sentences in columns called 'sentence1' and 'sentence2' if such column exists or the first two columns not named
-    # label if at least two columns are provided.
-    #
-    # If the CSVs/JSONs contain only one non-label column, the script does single sentence classification on this
-    # single column. You can easily tweak this behavior (see below)
-    #
-    # In distributed training, the load_dataset function guarantee that only one local process can concurrently
-    # download the dataset.
-    if data_args.task_name is not None:
-        # Downloading and loading a dataset from the hub.
-        raw_datasets = load_dataset("glue", data_args.task_name, cache_dir=model_args.cache_dir)
-    elif data_args.dataset_name is not None:
-        # Downloading and loading a dataset from the hub.
-        raw_datasets = load_dataset(
-            data_args.dataset_name, data_args.dataset_config_name, cache_dir=model_args.cache_dir
-        )
-    else:
-        # Loading a dataset from your local files.
-        # CSV/JSON training and evaluation files are needed.
-        data_files = {"train": data_args.train_file, "validation": data_args.validation_file}
-
-        # Get the test dataset: you can provide your own CSV/JSON test file (see below)
-        # when you use `do_predict` without specifying a GLUE benchmark task.
-        if training_args.do_predict:
-            if data_args.test_file is not None:
-                train_extension = data_args.train_file.split(".")[-1]
-                test_extension = data_args.test_file.split(".")[-1]
-                assert (
-                    test_extension == train_extension
-                ), "`test_file` should have the same extension (csv or json) as `train_file`."
-                data_files["test"] = data_args.test_file
-            else:
-                raise ValueError("Need either a GLUE task or a test file for `do_predict`.")
-
-        for key in data_files.keys():
-            logger.info(f"load a local file for {key}: {data_files[key]}")
-
-        if data_args.train_file.endswith(".csv"):
-            # Loading a dataset from local csv files
-            raw_datasets = load_dataset("csv", data_files=data_files, cache_dir=model_args.cache_dir)
-        else:
-            # Loading a dataset from local json files
-            raw_datasets = load_dataset("json", data_files=data_files, cache_dir=model_args.cache_dir)
-    # See more about loading any type of standard or custom dataset at
-    # https://huggingface.co/docs/datasets/loading_datasets.html.
-
-    # Labels
-    if data_args.task_name is not None:
-        is_regression = data_args.task_name == "stsb"
-        if not is_regression:
-            label_list = raw_datasets["train"].features["label"].names
-            num_labels = len(label_list)
-        else:
-            num_labels = 1
-    else:
-        is_regression = raw_datasets["train"].features["label"].dtype in ["float32", "float64"]
-        if is_regression:
-            num_labels = 1
-        else:
-            # A useful fast method:
-            # https://huggingface.co/docs/datasets/package_reference/main_classes.html#datasets.Dataset.unique
-            label_list = raw_datasets["train"].unique("label")
-            label_list.sort()  # Let's sort it for determinism
-            num_labels = len(label_list)
-
-    # Load pretrained model and tokenizer
-    # In distributed training, the .from_pretrained methods guarantee that only one local process can concurrently
-    # download model & vocab.
-    # student model
-    config = AutoConfig.from_pretrained(
-        model_args.config_name if model_args.config_name else model_args.model_name_or_path,
-        num_labels=num_labels,
-        finetuning_task=data_args.task_name,
-        cache_dir=model_args.cache_dir,
-        revision=model_args.model_revision,
-        use_auth_token=True if model_args.use_auth_token else None,
-        num_hidden_layers=model_args.num_layers
-    )
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
-        cache_dir=model_args.cache_dir,
-        use_fast=model_args.use_fast_tokenizer,
-        revision=model_args.model_revision,
-        use_auth_token=True if model_args.use_auth_token else None,
-    )
-    model = AutoModelForSequenceClassification.from_pretrained(
-        model_args.model_name_or_path,
-        from_tf=bool(".ckpt" in model_args.model_name_or_path),
-        config=config,
-        cache_dir=model_args.cache_dir,
-        revision=model_args.model_revision,
-        use_auth_token=True if model_args.use_auth_token else None,
-    )
     
+    raw_datasets = utils.load_glue_dataset(data_args, model_args, training_args)
+    is_regression, num_labels, label_list = utils.process_labels(data_args, raw_datasets)
+    config, model = utils.load_model(model_args, data_args, num_labels)
+    tokenizer = utils.load_tokenizer(model_args)
+
     # teacher model(only used in training)
     if training_args.do_train:
+        # t_config, teacher_model = utils.load_model()
         t_config = AutoConfig.from_pretrained(model_args.teacher_model, num_labels=num_labels, finetuning_task=data_args.task_name)
         teacher_model = AutoModelForSequenceClassification.from_pretrained(
             model_args.teacher_model,
@@ -481,7 +77,7 @@ def main():
 
     # Preprocessing the raw_datasets
     if data_args.task_name is not None:
-        sentence1_key, sentence2_key = task_to_keys[data_args.task_name]
+        sentence1_key, sentence2_key = constants.task_to_keys[data_args.task_name]
     else:
         # Again, we try to have some nice defaults but don't hesitate to tweak to your use case.
         non_label_column_names = [name for name in raw_datasets["train"].column_names if name != "label"]
@@ -553,7 +149,7 @@ def main():
             load_from_cache_file=not data_args.overwrite_cache,
             desc="Running tokenizer on dataset",
         )
-        raw_datasets = _remove_unused_columns(model, raw_datasets)
+        raw_datasets = utils.remove_unused_columns(model, raw_datasets)
         
     if training_args.do_train:
         train_dataset = raw_datasets["train"]
@@ -633,22 +229,9 @@ def main():
 
         for predict_dataset, task in zip(predict_datasets, tasks):
             # Removing the `label` columns because it contains -1 and Trainer won't like that.
-            
-            predict_dataset = predict_dataset.remove_columns("label")
-            predictions = trainer.predict(predict_dataset, metric_key_prefix="predict").predictions
-            predictions = np.squeeze(predictions) if is_regression else np.argmax(predictions, axis=1)
-            
             output_predict_file = os.path.join(training_args.output_dir, f"{task}.tsv")
-            if trainer.is_world_process_zero():
-                with open(output_predict_file, "w") as writer:
-                    logger.info(f"***** Predict results {task} *****")
-                    writer.write("index\tprediction\n")
-                    for index, item in enumerate(predictions):
-                        if is_regression:
-                            writer.write(f"{index}\t{item:3.3f}\n")
-                        else:
-                            item = label_list[item]
-                            writer.write(f"{index}\t{item}\n")
+            utils.perform_prediction(trainer, predict_dataset, task, output_predict_file, is_regression, label_list)
+
         return
 
     train_dataloader = DataLoader(
@@ -662,8 +245,8 @@ def main():
         t_optimizer = AdamW(teacher_model.parameters(), lr=model_args.t_learning_rate)
     
         if model_args.init_classifier_to_zero:
-            init_classifier_as_zero(teacher_model)
-            init_classifier_as_zero(model)
+            utils.init_classifier_as_zero(teacher_model)
+            utils.init_classifier_as_zero(model)
 
     # Scheduler and math around the number of training steps.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / training_args.gradient_accumulation_steps)
@@ -698,7 +281,9 @@ def main():
         model, teacher_model, optimizer, train_dataloader, eval_dataloader = accelerator.prepare(
                 model, teacher_model, optimizer, train_dataloader, eval_dataloader
             )
-     
+    
+    # TODO: Teacher, Student predict -> check performance
+
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / training_args.gradient_accumulation_steps)
     total_batch_size = training_args.per_device_train_batch_size * training_args.gradient_accumulation_steps
 
@@ -715,16 +300,45 @@ def main():
     best_metric = 0.0
     t_best_metric = 0.0
 
+    # One-shot magnitude pruning for teacher model
+    if training_args.do_train:
+        threshold = get_weight_threshold(teacher_model, rate=0.8, args=model_args)
+        weight_prune(teacher_model, threshold, model_args)
+
+    # Print teacher model state_dict after pruning
+    print("Teacher Model State_dict After Pruning:")
+    for name, param in teacher_model.state_dict().items():
+        print(name, param)
+
     for epoch in range(int(training_args.num_train_epochs)):
-        for step, batch in enumerate(train_dataloader):            
+        for step, batch in enumerate(train_dataloader):
+
+            # TODO: 이대로 테스트 해보고 합쳐서 확인
+            # use teacher logits as soft labels
+            teacher_model.eval()
+            model.train()
+                        
+            with torch.no_grad():
+                teacher_outputs = teacher_model(**batch)
+                t_logits = teacher_outputs.logits
+
+            outputs = model(**batch)
+            loss, logits = outputs.loss, outputs.logits
+            loss = model_args.alpha_kd * cal_loss(logits, t_logits, model_args.temperature) + (1 - model_args.alpha_kd) * loss
+        
+            # update the student
+            loss.backward()
+
             model.eval()
             teacher_model.train()
+
             with torch.no_grad():
                 outputs = model(**batch)
                 logits = outputs.logits
+
             teacher_outputs = teacher_model(**batch)
             t_loss, t_logits = teacher_outputs.loss, teacher_outputs.logits
-            t_loss = model_args.t_alpha_kd * cal_loss(t_logits,logits, model_args.temperature) + (1 - model_args.t_alpha_kd) * t_loss
+            t_loss = model_args.t_alpha_kd * cal_loss(t_logits, logits, model_args.temperature) + (1 - model_args.t_alpha_kd) * t_loss
             
             # update the teacher
             t_loss.backward()
@@ -734,18 +348,6 @@ def main():
                 t_lr_scheduler.step()
                 t_optimizer.zero_grad()
 
-            # use teacher logits as soft labels
-            teacher_model.eval()
-            model.train()
-           
-            with torch.no_grad():
-                teacher_outputs = teacher_model(**batch)
-                t_logits = teacher_outputs.logits
-
-            outputs = model(**batch)
-            loss, logits = outputs.loss, outputs.logits
-            loss = model_args.alpha_kd * cal_loss(logits, t_logits, model_args.temperature) + (1-model_args.alpha_kd) * loss
-           
             # update the student 
             loss = loss / int(training_args.gradient_accumulation_steps)
             loss.backward()
@@ -761,7 +363,6 @@ def main():
             if completed_steps % training_args.eval_steps == 0 or completed_steps == max_train_steps:
                 model.eval()
                 samples_seen = 0
-
 
                 # student evaluation
                 for step, batch in enumerate(eval_dataloader):
@@ -790,9 +391,9 @@ def main():
                 for key, value in eval_metric.items():
                     logger.info(f" eval_{key}:{value} ")
            
-                if data_args.task_name in acc_tasks:
+                if data_args.task_name in constants.acc_tasks:
                     metric_key = "accuracy"
-                elif data_args.task_name in f1_tasks:
+                elif data_args.task_name in constants.f1_tasks:
                     metric_key = "f1"
                 
                 if eval_metric[metric_key] > best_metric:
