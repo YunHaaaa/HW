@@ -302,13 +302,9 @@ def main():
 
     # One-shot magnitude pruning for teacher model
     if training_args.do_train:
-        threshold = get_weight_threshold(teacher_model, rate=0.8, args=model_args)
-        weight_prune(teacher_model, threshold, model_args)
-
+        pass
     # Print teacher model state_dict after pruning
-    print("Teacher Model State_dict After Pruning:")
-    for name, param in teacher_model.state_dict().items():
-        print(name, param)
+
 
     for epoch in range(int(training_args.num_train_epochs)):
         for step, batch in enumerate(train_dataloader):

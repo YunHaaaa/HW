@@ -27,6 +27,15 @@
 
     pip install -r requirements.txt
     ```
+
+```bash
+conda env create -f envs/pruning.yaml
+conda activate pruning
+pip uninstall nn_pruning
+pip install git+https://github.com/[anonymized]/nn_pruning.git@automodel
+```
+
+
 <span id="2"></span>
 
 ### Usage
